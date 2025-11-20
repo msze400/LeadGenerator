@@ -1,24 +1,39 @@
-# main.py
 import os
 import time
 import re
 import json
+import base64
 from datetime import datetime
-from urllib.parse import quote_plus
-
 from playwright.sync_api import sync_playwright
+from openai import OpenAI
 
 QUERY = "iso web designer"
 SCROLL_PAGES = 6
-
+SERVICE_ACCOUNT_PATH = "service_account.json"
+MODEL = "gpt-4o-mini"   # or gpt-4.1 or gpt-5.1 if you want
 
 # ---------------- HELPERS ----------------
 
-def clean_text(text):
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text).strip()
+def load_openai_key():
+    with open(SERVICE_ACCOUNT_PATH, "r") as f:
+        data = json.load(f)
 
+    if "openai_key" not in data:
+        raise KeyError(
+            "No 'openai_key' found in service_account.json.\n"
+            "Add:  \"openai_key\": \"sk-...\""
+        )
+
+    return data["openai_key"]
+
+
+def clean_text(txt):
+    if not txt:
+        return ""
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+# ---------------- COOKIE LOADING ----------------
 
 def load_cookies(context):
     if not os.path.exists("cookies.json"):
@@ -26,151 +41,143 @@ def load_cookies(context):
     with open("cookies.json", "r") as f:
         cookies = json.load(f)
     context.add_cookies(cookies)
-    print("[INFO] Cookies loaded.")
+    print("[INFO] Cookies loaded. Logged into Facebook.")
 
 
-# ---------------- SEARCH ----------------
+# ---------------- FACEBOOK SEARCH ----------------
 
 def fb_search(page):
+    from urllib.parse import quote_plus
     encoded = quote_plus(QUERY)
     url = f"https://www.facebook.com/search/posts/?q={encoded}"
-    print(f"[ACTION] Go to: {url}")
+    print(f"[ACTION] Opening search URL: {url}")
     page.goto(url, wait_until="domcontentloaded")
     time.sleep(3)
 
 
-# ---------------- SCRAPING VIA VISUAL ANCHORS ----------------
+# ---------------- OPENAI VISION ----------------
 
-def get_post_candidates(page):
+def call_openai_batch(images_b64, client):
     """
-    Finds posts using visible UI anchors.
-    This avoids depending on obfuscated class names.
+    Send ALL screenshots at once to OpenAI Vision.
+    This saves a TON of credits.
     """
 
-    anchors = [
-        "Like",
-        "Comment",
-        "Share",
+    print(f"\n[SENDING] {len(images_b64)} images → OpenAI Vision in ONE request...\n")
+
+    content_blocks = [
+        {
+            "type": "text",
+            "text": """
+Extract ALL visible **real Facebook posts** from these screenshots.
+
+Return ONLY valid JSON in the format:
+
+{
+  "posts": [
+    {
+      "author": "...",
+      "snippet": "...",
+      "timestamp": "...",
+      "permalink_hint": "..."
+    }
+  ]
+}
+
+NO markdown.  
+NO commentary.  
+NO made-up posts.
+"""
+        }
     ]
 
-    locs = []
-    for a in anchors:
-        locs.extend(page.get_by_text(a).all())
+    # Add every image to the same request
+    for img in images_b64:
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img}"}
+        })
 
-    unique_posts = set()
-    post_elements = []
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{
+            "role": "user",
+            "content": content_blocks
+        }]
+    )
 
-    for loc in locs:
-        try:
-            post = loc.locator("xpath=ancestor::div[contains(@role,'article')]").first
+    raw = response.choices[0].message.content
 
-            if post.count() == 0:
-                continue
+    # Clean markdown if model tries to add it
+    raw = raw.replace("```json", "").replace("```", "").strip()
 
-            box = post.bounding_box()
-
-            # Use bounding box as a unique identifier
-            if box:
-                key = (round(box["x"]), round(box["y"]))
-                if key not in unique_posts:
-                    unique_posts.add(key)
-                    post_elements.append(post)
-        except:
-            pass
-
-    print(f"[INFO] Found ~{len(post_elements)} post candidates")
-    return post_elements
-
-
-def extract_post(post):
-    """
-    Extracts author, snippet, and permalink from a post container.
-    Everything uses visual/role/text anchors, not classnames.
-    """
-
-    # ---------- AUTHOR ----------
-    author = ""
     try:
-        author_loc = post.locator("a[role='link']").first
-        if author_loc.count():
-            author = clean_text(author_loc.inner_text())
-    except:
-        pass
-
-    # ---------- SNIPPET ----------
-    snippet = ""
-    try:
-        msg = post.locator("div[dir='auto']").first
-        if msg.count():
-            snippet = clean_text(msg.inner_text())
-    except:
-        pass
-
-    # ---------- PERMALINK ----------
-    permalink = ""
-    try:
-        link = post.locator("a[href*='/posts/'], a[href*='/groups/'], a[href*='/permalink/']").first
-        if link.count():
-            permalink = link.get_attribute("href")
-    except:
-        pass
-
-    return {
-        "author": author,
-        "snippet": snippet,
-        "permalink": permalink or ""
-    }
-
-
-def scrape_posts(page):
-    posts = get_post_candidates(page)
-
-    extracted = []
-    seen_snippets = set()
-
-    for p in posts:
-        data = extract_post(p)
-        if not data["snippet"]:
-            continue
-
-        # Deduplicate by text
-        if data["snippet"] not in seen_snippets:
-            seen_snippets.add(data["snippet"])
-            extracted.append(data)
-
-    print(f"[INFO] Extracted {len(extracted)} unique posts")
-    return extracted
+        return json.loads(raw)
+    except Exception:
+        print("\n[ERROR] Failed to decode JSON. RAW OUTPUT:\n", raw)
+        return {"posts": []}
 
 
 # ---------------- MAIN ----------------
 
 def main():
+    OPENAI_KEY = load_openai_key()
+    client = OpenAI(api_key=OPENAI_KEY)
+
+    all_posts = []
+    all_images = []
+    seen_snippets = set()
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=False, slow_mo=50)
         context = browser.new_context()
-
         load_cookies(context)
-        page = context.new_page()
 
+        page = context.new_page()
         fb_search(page)
 
-        print("[ACTION] Scrolling…")
+        print("[ACTION] Collecting screenshots...")
+
+        # ----- PHASE 1: Collect all screenshots locally -----
         for i in range(SCROLL_PAGES):
+            print(f"[SCROLL] {i+1}/{SCROLL_PAGES}")
             page.mouse.wheel(0, 3000)
             time.sleep(1.5)
 
-        results = scrape_posts(page)
+            screenshot_path = f"fb_screenshot_{i+1}.png"
+            print(f"[ACTION] Taking screenshot → {screenshot_path}")
+            page.screenshot(path=screenshot_path)
 
+            with open(screenshot_path, "rb") as f:
+                all_images.append(base64.b64encode(f.read()).decode())
+
+        # ----- PHASE 2: ONE OpenAI Vision Call -----
+        result = call_openai_batch(all_images, client)
+
+        posts = result.get("posts", [])
+
+        # Deduplicate by snippet
+        for post in posts:
+            snippet = clean_text(post.get("snippet", ""))
+            if snippet and snippet not in seen_snippets:
+                seen_snippets.add(snippet)
+                all_posts.append(post)
+
+        # Final output
         output = {
             "query": QUERY,
             "collected_at": datetime.utcnow().isoformat(),
-            "posts": results
+            "posts": all_posts
         }
 
+        print("\n===== FINAL JSON OUTPUT =====")
         print(json.dumps(output, indent=2, ensure_ascii=False))
+        print("=================================\n")
 
-        input("\nPress ENTER to close browser…")
+        input("Press Enter to CLOSE browser...")
         browser.close()
+
+        print("[DONE] Finished scraping.")
 
 
 if __name__ == "__main__":
